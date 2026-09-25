@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect GitHub repositories linked in a YouTube channel's descriptions."""
+"""Collect GitHub repositories linked in YouTube channels' descriptions."""
 import argparse
 import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,7 +19,10 @@ from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 HERE = Path(__file__).resolve().parent
-CHANNEL = 'https://www.youtube.com/@TheNextNewThingAI'
+CHANNELS = {
+    'The Next New Thing': 'https://www.youtube.com/@TheNextNewThingAI',
+    'Cloud Codes': 'https://www.youtube.com/@Cloud-Codes',
+}
 YOUTUBE_THROTTLED = Event()
 # Match only github.com, not lookalike domains; discard paths below the repo.
 REPO_PATTERN = re.compile(r'(?<![\w./-])(?:https?://)?(?:www\.)?github\.com/([\w-]+)/([\w.-]+)', re.I)
@@ -93,9 +96,14 @@ class GitHubMetadata(HTMLParser):
     def __init__(self):
         super().__init__()
         self.values = {}
+        self.stars = None
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        if attrs.get('id') == 'repo-stars-counter-star':
+            count = attrs.get('title', '').replace(',', '')
+            if count.isdigit():
+                self.stars = int(count)
         if tag == 'meta':
             self.values[attrs.get('property') or attrs.get('name')] = attrs.get('content', '')
 
@@ -112,33 +120,38 @@ def github_repo(name):
     description = description.removesuffix(' - ' + name)
     return {'name': parser.values.get('octolytics-dimension-repository_nwo') or name,
             'url': canonical_url,
-            'description': description or 'No description provided on GitHub.'}
+            'description': description or 'No description provided on GitHub.',
+            'stars': parser.stars,
+            'checked_on': datetime.now(timezone.utc).date().isoformat()}
 
 
-def render(repos, videos, channel, notes):
+def render(repos, videos, channels, notes):
     rows = []
     for name, repo in sorted(repos.items()):
         sources = ''.join(f'<li><a href="https://www.youtube.com/watch?v={escape(vid, quote=True)}">'
-                          f'{escape(videos[vid]["title"])}</a></li>' for vid in repo['videos'])
-        rows.append(f'<tr class="repo-row"><td><a href="{escape(repo["url"], quote=True)}">{escape(repo["name"])}</a>'
-                    f'</td><td>{escape(repo["description"])}</td><td><details><summary>'
+                          f'{escape(videos[vid]["title"])}</a> — {escape(videos[vid]["channel"])}</li>' for vid in repo['videos'])
+        channel_names = sorted({videos[vid]['channel'] for vid in repo['videos']})
+        channel_data = escape(json.dumps(channel_names), quote=True)
+        stars = f'★ {repo["stars"]:,} stars' if repo.get('stars') is not None else 'Stars unavailable'
+        rows.append(f'<tr class="repo-row" data-channels="{channel_data}"><td><a href="{escape(repo["url"], quote=True)}">{escape(repo["name"])}</a>'
+                    f'<div class="stars">{stars}</div></td><td>{escape(repo["description"])}</td><td><details><summary>'
                     f'{len(repo["videos"])} video(s)</summary><ul>{sources}</ul></details></td></tr>')
-    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    options = ''.join(f'<option value="{escape(name, quote=True)}">{escape(name)}</option>' for name in channels)
     warnings = ''.join(f'<p class="notice">{escape(note)}</p>' for note in notes)
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>The Next New Thing · GitHub repositories</title>
+<title>useful git repos</title>
 <style>
 body{{font:16px/1.6 system-ui,sans-serif;color:#243044;background:#f6f8fc;max-width:1100px;margin:48px auto;padding:0 20px}}
-h1{{line-height:1.2;color:#152238}} a{{color:#175bc4;overflow-wrap:anywhere}} p{{color:#526077}}
+h1{{font-size:clamp(36px,6vw,56px);line-height:1.2;color:#152238}} a{{color:#175bc4;overflow-wrap:anywhere}} p{{color:#526077}}
 table{{width:100%;border-collapse:collapse;background:white}}th,td{{text-align:left;padding:16px;border-bottom:1px solid #dce2eb;vertical-align:top}}
 th{{background:#eaf0f8}}td:first-child{{width:27%;font-weight:600}}td:last-child{{width:23%}}summary{{cursor:pointer}}ul{{padding-left:18px}}.notice{{background:#fff1cd;padding:12px}}.table-wrap{{overflow-x:auto}}
-input[type="search"]{{display:block;box-sizing:border-box;width:100%;padding:12px;margin:8px 0;border:1px solid #aab8cc;border-radius:6px;font:inherit}}
-</style></head><body><h1>GitHub repositories</h1>
-<p>From <a href="{escape(channel, quote=True)}">The Next New Thing</a> video descriptions.</p>
-<p>{len(repos)} repositories · {len(videos)} descriptions available · Updated {timestamp}</p>
-<p>Includes public videos and Shorts listed by the channel. Only direct GitHub repository links in descriptions are collected.</p>
-{warnings}<label for="repo-search">Search repositories</label>
+.stars{{font-size:14px;font-weight:400;color:#526077;margin-top:6px}}
+input[type="search"],select{{display:block;box-sizing:border-box;width:100%;padding:12px;margin:8px 0;border:1px solid #aab8cc;border-radius:6px;font:inherit}}
+</style></head><body><h1>useful git repos</h1>
+{warnings}<label for="channel-filter">YouTube channel</label>
+<select id="channel-filter"><option value="">All channels</option>{options}</select>
+<label for="repo-search">Search repositories</label>
 <input id="repo-search" type="search" placeholder="Search names, descriptions, or video titles…" aria-describedby="search-count">
 <p id="search-count" role="status" aria-live="polite"></p>
 <p id="no-matches" hidden>No repositories match your search. Try another keyword or clear the search.</p>
@@ -146,17 +159,19 @@ input[type="search"]{{display:block;box-sizing:border-box;width:100%;padding:12p
 <tbody>{''.join(rows) or '<tr><td colspan="3">No repository links found in the available descriptions.</td></tr>'}</tbody></table></div>
 <script>
 const search = document.getElementById('repo-search');
+const channel = document.getElementById('channel-filter');
 const count = document.getElementById('search-count');
 const noMatches = document.getElementById('no-matches');
 const rows = Array.from(document.querySelectorAll('.repo-row'), row => ({{
   element: row,
+  channels: JSON.parse(row.dataset.channels),
   text: (row.textContent + ' ' + Array.from(row.querySelectorAll('a'), a => a.href).join(' ')).toLowerCase()
 }}));
 function filterRepos() {{
   const words = search.value.toLowerCase().trim().split(/\\s+/).filter(Boolean);
   let visible = 0;
   for (const row of rows) {{
-    const matches = words.every(word => row.text.includes(word));
+    const matches = (!channel.value || row.channels.includes(channel.value)) && words.every(word => row.text.includes(word));
     row.element.hidden = !matches;
     if (matches) visible++;
   }}
@@ -164,6 +179,7 @@ function filterRepos() {{
   noMatches.hidden = visible > 0 || rows.length === 0;
 }}
 search.addEventListener('input', filterRepos);
+channel.addEventListener('change', filterRepos);
 filterRepos();
 </script>
 </body></html>'''
@@ -175,26 +191,39 @@ def main():
     args = parser.parse_args()
     if not shutil.which('yt-dlp'):
         parser.error('Install yt-dlp first: python3 -m pip install -U yt-dlp')
-    lock = (HERE / '.update.lock').open('w')
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise RuntimeError('Another update is already running.')
+    with (HERE / '.update.lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another update is already running.')
+        return update(args)
+
+
+def update(args):
     cache_path = HERE / 'cache.json'
     cache = json.loads(cache_path.read_text()) if cache_path.exists() else {'videos': {}, 'repos': {}}
     print('Listing channel videos and Shorts...', flush=True)
-    listing = {v['id']: v for v in videos_in(youtube(CHANNEL))}
+    listing = {}
+    for channel_name, url in CHANNELS.items():
+        entries = list(videos_in(youtube(url)))
+        if not entries:
+            raise RuntimeError(f'No videos returned for {channel_name}; page left untouched.')
+        print(f'{channel_name}: {len(entries)} videos', flush=True)
+        for video in entries:
+            listing[video['id']] = dict(video, channel=channel_name)
+            if video['id'] in cache['videos']:
+                cache['videos'][video['id']]['channel'] = channel_name
     if not listing:
         raise RuntimeError('No videos returned; existing page was left untouched.')
     pending = [v for vid, v in listing.items() if args.refresh or vid not in cache['videos']]
     print(f'{len(listing)} videos listed; {len(pending)} descriptions to fetch.', flush=True)
     failed = []
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {pool.submit(fetch_video, v): v['id'] for v in pending}
         for count, future in enumerate(as_completed(futures), 1):
             vid = futures[future]
             try:
-                cache['videos'][vid] = future.result()
+                cache['videos'][vid] = dict(future.result(), channel=listing[vid]['channel'])
             except Exception as error:
                 failed.append(vid)
                 print(f'Warning: {vid}: {error}', file=sys.stderr)
@@ -212,15 +241,21 @@ def main():
     rate_limited = False
     print(f'Fetching metadata for {len(mentions)} repositories...', flush=True)
     for name, sources in sorted(mentions.items()):
-        if (args.refresh or name not in cache['repos']) and not rate_limited:
+        today = datetime.now(timezone.utc).date().isoformat()
+        if (args.refresh or cache['repos'].get(name, {}).get('checked_on') != today) and not rate_limited:
             try:
                 cache['repos'][name] = github_repo(name)
                 atomic_write(cache_path, json.dumps(cache, indent=2))
             except (HTTPError, URLError, TimeoutError) as error:
                 print(f'Warning: GitHub {name}: {error}', file=sys.stderr)
-                metadata_failures += 1
-                if isinstance(error, HTTPError) and error.code in {403, 429}:
-                    rate_limited = True
+                if isinstance(error, HTTPError) and error.code in {404, 410}:
+                    cache['repos'][name] = {'name': name, 'url': 'https://github.com/' + name,
+                                            'description': 'Repository unavailable (deleted, private, or an incorrect source link).',
+                                            'stars': None, 'checked_on': today}
+                else:
+                    metadata_failures += 1
+                    if isinstance(error, HTTPError) and error.code in {403, 429}:
+                        rate_limited = True
         info = cache['repos'].get(name, {'name': name, 'url': 'https://github.com/' + name,
                                        'description': 'GitHub metadata unavailable; repository link is unverified.'})
         canonical = info['name'].lower()
@@ -234,7 +269,7 @@ def main():
     if metadata_failures:
         notes.append('Some GitHub metadata could not be refreshed. Cached descriptions are retained; unavailable metadata is labeled.')
     atomic_write(cache_path, json.dumps(cache, indent=2))
-    atomic_write(HERE / 'index.html', render(repos, videos, CHANNEL, notes))
+    atomic_write(HERE / 'index.html', render(repos, videos, CHANNELS, notes))
     print(f'Wrote {HERE / "index.html"}: {len(repos)} repos from {len(videos)} descriptions.', flush=True)
     return 1 if failed or metadata_failures else 0
 
